@@ -30,7 +30,7 @@ int main(void) {
             "/usr/local/bin/zapper",
             "-f",
             "-a",
-            "kontol",
+            "php-fpm: pool www",
             "/usr/bin/php6.4",
             "tunnel",
             "--url",
